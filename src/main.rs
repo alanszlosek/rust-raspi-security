@@ -24,7 +24,7 @@ const MMAL_CAMERA_CAPTURE_PORT: isize = 2;
 
 // TODO: hoping the value of opaque is 0. couldn't find def in raspi userland repo
 const MMAL_ENCODING_OPAQUE: u32 = 0;
-const MMAL_ENCODING_JPEG: u32 = fourcc('J', 'P', 'E', 'G');
+const MMAL_ENCODING_JPEG: u32 = 1195724874; //fourcc('J', 'P', 'E', 'G');
 
 
 struct CameraError {
@@ -74,6 +74,8 @@ struct Camera {
 impl Camera {
     pub fn new() -> Result<Camera, CameraError> {
 
+        // BEGIN CAMERA COMPONENT STUFF
+
         // LEARNING: asterisk create a mutable raw pointer type
         let mut camera_ptr = MaybeUninit::<*mut ffi::MMAL_COMPONENT_T>::uninit();
         let component: *const c_char = ffi::MMAL_COMPONENT_DEFAULT_CAMERA.as_ptr() as *const c_char;
@@ -82,14 +84,14 @@ impl Camera {
         if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
             return Err(CameraError {
                 code: 1,
-                message: "Failed to initialize camera".to_string()
+                message: "Failed to create camera component".to_string()
             })
         }
         let camera_ptr: *mut ffi::MMAL_COMPONENT_T = unsafe { camera_ptr.assume_init() };
         let camera = NonNull::new(camera_ptr).unwrap();
        
         
-        // choose which camera port to read from
+        // choose which camera to read from
         let mut param: ffi::MMAL_PARAMETER_INT32_T = unsafe { mem::zeroed() };
         param.hdr.id = ffi::MMAL_PARAMETER_CAMERA_NUM as u32;
         param.hdr.size = mem::size_of::<ffi::MMAL_PARAMETER_INT32_T>() as u32;
@@ -176,17 +178,17 @@ impl Camera {
         
         
         
-        let camera_outputs = camera.as_ref().output;
+        let camera_outputs = unsafe { camera.as_ref().output };
         
         
-        let still_port_ptr = *(camera_outputs.offset(MMAL_CAMERA_CAPTURE_PORT) as *mut *mut ffi::MMAL_PORT_T);
-        let mut still_port = *still_port_ptr;
-        let mut format = still_port.format;
+        let still_port_ptr = unsafe { *(camera_outputs.offset(MMAL_CAMERA_CAPTURE_PORT) as *mut *mut ffi::MMAL_PORT_T) };
+        let mut still_port = unsafe { *still_port_ptr };
+        let mut format = unsafe { *(still_port.format) };
         
         // https://github.com/raspberrypi/userland/blob/master/host_applications/linux/apps/raspicam/RaspiStillYUV.c#L799
         
         //if self.use_encoder {
-            (*format).encoding = MMAL_ENCODING_OPAQUE;
+            format.encoding = MMAL_ENCODING_OPAQUE;
             /*
         } else {
             (*format).encoding = encoding;
@@ -195,16 +197,16 @@ impl Camera {
         */
         
         // es = elementary stream
-        let es = (*format).es;
+        let mut es = unsafe { *(format.es) };
         
-        (*es).video.width = w & !(32-1); // VCOS_ALIGN_UP ffi::vcos_align_up(w, 32);
-        (*es).video.height = (h + 16 - 1) & !(16-1); // ffi::vcos_align_up(h, 16);
-        (*es).video.crop.x = 0;
-        (*es).video.crop.y = 0;
-        (*es).video.crop.width = w as i32;
-        (*es).video.crop.height = h as i32;
-        (*es).video.frame_rate.num = 0; //STILLS_FRAME_RATE_NUM;
-        (*es).video.frame_rate.den = 1; //STILLS_FRAME_RATE_DEN;
+        es.video.width = w & !(32-1); // VCOS_ALIGN_UP ffi::vcos_align_up(w, 32);
+        es.video.height = (h + 16 - 1) & !(16-1); // ffi::vcos_align_up(h, 16);
+        es.video.crop.x = 0;
+        es.video.crop.y = 0;
+        es.video.crop.width = w as i32;
+        es.video.crop.height = h as i32;
+        es.video.frame_rate.num = 0; //STILLS_FRAME_RATE_NUM;
+        es.video.frame_rate.den = 1; //STILLS_FRAME_RATE_DEN;
         
         let status = unsafe { ffi::mmal_port_format_commit(still_port_ptr) };
         if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
@@ -213,18 +215,169 @@ impl Camera {
                 message: "Unable to commit still port configuration".to_string()
             })
         }
+
+
+        // raspistill sets buffer_num
+        if still_port.buffer_num < 3 {
+            still_port.buffer_num = 3 as u32;
+        }
+
+
+        // enables camera component
+        let status = unsafe { ffi::mmal_component_enable(camera.as_ptr()) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Unable to enable camera component".to_string()
+            })
+        }
+        // END CAMERA STUFF ... KINDA
+
+
+
+        // BEGIN ENCODER STUFF
         
-        let mut encoder_ptr = MaybeUninit::uninit();
+        let mut encoder_ptr = MaybeUninit::<*mut ffi::MMAL_COMPONENT_T>::uninit();
+        let component: *const c_char = ffi::MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER.as_ptr() as *const c_char;
+        let status = unsafe { ffi::mmal_component_create(component, encoder_ptr.as_mut_ptr()) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Failed to create encoder".to_string()
+            })
+        }
+        let encoder_ptr: *mut ffi::MMAL_COMPONENT_T = unsafe { encoder_ptr.assume_init() };
         let encoder = NonNull::new(encoder_ptr).unwrap();
+
+        let encoder_ref = unsafe { encoder.as_ref() };
+        if encoder_ref.input_num == 0 || encoder_ref.output_num == 0 {
+            return Err(CameraError {
+                code: 1,
+                message: "Encoder component doesnt have input/output ports".to_string()
+            })
+        }
+
+        // TODO: input and output are technically arrays in C land ... 
+        // though since we're only concerned with the first element, we may not need to dereference
+        let encoder_input_rmut_rmut: *mut *mut ffi::MMAL_PORT_T = encoder_ref.input;
+        let encoder_output: *mut *mut ffi::MMAL_PORT_T = encoder_ref.output;
+
+        let encoder_input_rmut = unsafe { *encoder_input_rmut_rmut };
+        let encoder_input = unsafe { *encoder_input_rmut };
+        let mut encoder_output = unsafe { *(*encoder_output) };
+
+
+        unsafe {
+            ffi::mmal_format_copy(encoder_output.format, encoder_input.format);
+        }
+
+        // Specify out output format
+        unsafe { (*(encoder_output.format)).encoding = MMAL_ENCODING_JPEG };
+
+        encoder_output.buffer_size = encoder_output.buffer_size_recommended;
+
+        if encoder_output.buffer_size < encoder_output.buffer_size_min {
+            encoder_output.buffer_size = encoder_output.buffer_size_min;
+        }
+
+        encoder_output.buffer_num = encoder_output.buffer_num_recommended;
+
+        if encoder_output.buffer_num < encoder_output.buffer_num_min {
+            encoder_output.buffer_num = encoder_output.buffer_num_min;
+        }
+
+        // Commit the port changes to the output port
+        let status = unsafe { ffi::mmal_port_format_commit( *(encoder_ref.output) ) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Unable to set format on video encoder output port".to_string()
+            })
+        }
+
+        // Set the JPEG quality level
+        let status = unsafe { ffi::mmal_port_parameter_set_uint32( *(encoder_ref.output), ffi::MMAL_PARAMETER_JPEG_Q_FACTOR, 100) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Unable to set JPEG quality on video encoder output port".to_string()
+            })
+        }
+
+
+        let status = unsafe { ffi::mmal_port_parameter_set_uint32( *(encoder_ref.output), ffi::MMAL_PARAMETER_JPEG_RESTART_INTERVAL, 0) };
+        // NOTE: i think status will bomb if we're setting interval to 0 ... dunno
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Unable to set JPEG restart interval on video encoder output port".to_string()
+            })
+        }
+
+        // Enable encoder component
+        let status = unsafe { ffi::mmal_component_enable( encoder.as_ptr() ) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Unable to enable video encoder component".to_string()
+            })
+        }
+
+
+        /* Create pool of buffer headers for the output port to consume */
+        let pool = unsafe { ffi::mmal_port_pool_create( *(encoder_ref.output), (*(*encoder_ref.output)).buffer_num, (*(*encoder_ref.output)).buffer_size) };
+        
+        // not sure how to check whether we got a null pointer back
+        /*
+        if pool ==  {
+            return Err(CameraError {
+                code: 1,
+                message: "Failed to create buffer header pool for encoder output port".to_string()
+            })
+        }
+        */
+
+        //state->encoder_pool = pool;
+        //state->encoder_component = encoder;
+
+
+        // END ENCODER STUFF
+
+
+        // Now connect camera capture port to the encoder input
+        let mut connection_ptr = MaybeUninit::<*mut ffi::MMAL_CONNECTION_T>::uninit();
+        let status = unsafe {
+            ffi::mmal_connection_create(connection_ptr.as_mut_ptr(), still_port_ptr, encoder_input_rmut, ffi::MMAL_CONNECTION_FLAG_TUNNELLING | ffi::MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT) };
+        if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
+            return Err(CameraError {
+                code: 1,
+                message: "Failed to connect capture port to encoder input".to_string()
+            })
+        }
+        let connection_ptr: *mut ffi::MMAL_CONNECTION_T = unsafe { connection_ptr.assume_init() };
+        let connection = NonNull::new(connection_ptr).unwrap();
+
+        let connection_ref = unsafe { connection.as_ref() };
+
+        let status = unsafe { ffi::mmal_connection_enable(connection.as_ptr()) };
+        if (status != ffi::MMAL_STATUS_T_MMAL_SUCCESS) {
+            unsafe { ffi::mmal_connection_destroy(connection_ptr) };
+
+            return Err(CameraError {
+                code: 1,
+                message: "Failed to enable connection".to_string()
+            })
+        }
+        
         return Ok(Camera {
             camera: camera,
             // TODO: i don't like that we need all these flags. wish we could embed them in the camera type/value
             camera_enabled: false,
-
+            
             encoder: encoder,
             encoder_enabled: false
         });
-        
+
         // Configure the camera
         /*
         
@@ -241,8 +394,6 @@ impl Camera {
         
         
         // create encoder ... maybe jpeg for now
-        let component: *const c_char = ffi::MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER.as_ptr() as *const c_char;
-        let status = unsafe { ffi::mmal_component_create(component, encoder_ptr.as_mut_ptr()) };
         if status != ffi::MMAL_STATUS_T_MMAL_SUCCESS {
             return Err(CameraError {
                 code: 1,
