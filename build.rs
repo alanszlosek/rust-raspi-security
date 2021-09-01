@@ -32,7 +32,7 @@ fn main() {
 
         // Only include mmal stuff
         .allowlist_type(r"(MMAL|VCOS)_.*")
-        .allowlist_function(r"(?:mmal_|vcos_|bcm_).*")
+        .allowlist_function(r"(mmal_|vcos_|bcm_).*")
         .allowlist_var(r"(MMAL|VCOS)_.*")
 
         // Tell it where to find the MMAL includes

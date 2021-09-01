@@ -1,14 +1,20 @@
+# Note
+
+This doesn't work yet. I'm currently porting C code from RaspiStill.c and once I can capture a still I'll start morphing towards security camera functionality.
+
 # Welcome
 
-I have a Python-based RasPi security camera project, but I have a hunch that a Rust version would be better performant since I'd be working closer to MMAL itself. Plus, I'd like to continue my effort to learn Rust. So here we are.
+I have a Python-based RasPi security camera project, but I have a hunch that a Rust version would perform better since I'd be working closer to MMAL itself. Plus, I'd like to continue my effort to learn Rust. So here we are.
 
 # Project Goals
 
 * Leverage the lower-level nature of Rust to create a more performant motion detection security camera application
+* Try to exceed my Python version: 1080p h264 videos when motion is detected
 
 # Personal Goals
 
 * Learn Rust by engaging in a larger, real-world project
+* Have fun
 
 # Features
 

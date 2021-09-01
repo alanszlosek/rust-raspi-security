@@ -368,6 +368,178 @@ impl Camera {
                 message: "Failed to enable connection".to_string()
             })
         }
+
+
+        // COPIED FROM C CODE, LEFT OFF HERE
+
+        // TODO: these semaphore functions aren't ending up in our rust bindings
+        // Semaphore stuff to synchronize IO operations
+        // semaphore which is posted when we reach end of frame (indicates end of capture or fault)
+        let mut semaphore_ptr = MaybeUninit::<*mut ffi::MMAL_CONNECTION_T>::uninit();
+        let status = unsafe { ffi::vcos_semaphore_create(semaphore_ptr.as_mut_ptr(), "RustSec-sem", 0) };
+        if (status != ffi::MMAL_STATUS_T_MMAL_SUCCESS) {
+            // TODO: tear down everything?
+            return Err(CameraError {
+                code: 1,
+                message: "Failed to create semaphore".to_string()
+            })
+        }
+
+        let running = true;
+        while running == true {
+            // simple timeout for a single capture
+            // TODO: fix
+            // this just uses nanosleep
+            vcos_sleep(state->timeout);
+
+            // TODO: not sure which one we need
+            if (state.datetime)
+            {
+                time_t rawtime;
+                struct tm *timeinfo;
+
+                time(&rawtime);
+                timeinfo = localtime(&rawtime);
+
+                frame = timeinfo->tm_mon+1;
+                frame *= 100;
+                frame += timeinfo->tm_mday;
+                frame *= 100;
+                frame += timeinfo->tm_hour;
+                frame *= 100;
+                frame += timeinfo->tm_min;
+                frame *= 100;
+                frame += timeinfo->tm_sec;
+            }
+            if (state.timestamp)
+            {
+                frame = (int)time(NULL);
+            }
+
+
+
+            int num, q;
+
+            // Must do this before the encoder output port is enabled since
+            // once enabled no further exif data is accepted
+            if ( state.enableExifTags )
+            {
+                struct gps_data_t *gps_data = raspi_gps_lock();
+                add_exif_tags(&state, gps_data);
+                raspi_gps_unlock();
+            }
+            else
+            {
+                mmal_port_parameter_set_boolean(
+                state.encoder_component->output[0], MMAL_PARAMETER_EXIF_DISABLE, 1);
+            }
+
+            // Same with raw, apparently need to set it for each capture, whilst port
+            // is not enabled
+            if (state.wantRAW)
+            {
+                if (mmal_port_parameter_set_boolean(camera_still_port, MMAL_PARAMETER_ENABLE_RAW_CAPTURE, 1) != MMAL_SUCCESS)
+                {
+                vcos_log_error("RAW was requested, but failed to enable");
+                }
+            }
+
+            // There is a possibility that shutter needs to be set each loop.
+            if (mmal_status_to_int(mmal_port_parameter_set_uint32(state.camera_component->control, MMAL_PARAMETER_SHUTTER_SPEED, state.camera_parameters.shutter_speed)) != MMAL_SUCCESS)
+                vcos_log_error("Unable to set shutter speed");
+
+            // Enable the encoder output port
+            encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *)&callback_data;
+
+            if (state.common_settings.verbose)
+                fprintf(stderr, "Enabling encoder output port\n");
+
+            // Enable the encoder output port and tell it its callback function
+            status = mmal_port_enable(encoder_output_port, encoder_buffer_callback);
+
+            // Send all the buffers to the encoder output port
+            num = mmal_queue_length(state.encoder_pool->queue);
+
+            for (q=0; q<num; q++)
+            {
+                MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state.encoder_pool->queue);
+
+                if (!buffer)
+                vcos_log_error("Unable to get a required buffer %d from pool queue", q);
+
+                if (mmal_port_send_buffer(encoder_output_port, buffer)!= MMAL_SUCCESS)
+                vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
+            }
+
+            if (state.burstCaptureMode)
+            {
+                mmal_port_parameter_set_boolean(state.camera_component->control,  MMAL_PARAMETER_CAMERA_BURST_CAPTURE, 1);
+            }
+
+            if(state.camera_parameters.enable_annotate)
+            {
+                if ((state.camera_parameters.enable_annotate & ANNOTATE_APP_TEXT) && state.common_settings.gps)
+                {
+                char *text = raspi_gps_location_string();
+                raspicamcontrol_set_annotate(state.camera_component, state.camera_parameters.enable_annotate,
+                                                text,
+                                                state.camera_parameters.annotate_text_size,
+                                                state.camera_parameters.annotate_text_colour,
+                                                state.camera_parameters.annotate_bg_colour,
+                                                state.camera_parameters.annotate_justify,
+                                                state.camera_parameters.annotate_x,
+                                                state.camera_parameters.annotate_y
+                                            );
+                free(text);
+                }
+                else
+                raspicamcontrol_set_annotate(state.camera_component, state.camera_parameters.enable_annotate,
+                                                state.camera_parameters.annotate_string,
+                                                state.camera_parameters.annotate_text_size,
+                                                state.camera_parameters.annotate_text_colour,
+                                                state.camera_parameters.annotate_bg_colour,
+                                                state.camera_parameters.annotate_justify,
+                                                state.camera_parameters.annotate_x,
+                                                state.camera_parameters.annotate_y
+                                            );
+            }
+
+            if (state.common_settings.verbose)
+                fprintf(stderr, "Starting capture %d\n", frame);
+
+            if (mmal_port_parameter_set_boolean(camera_still_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
+            {
+                vcos_log_error("%s: Failed to start capture", __func__);
+            }
+            else
+            {
+                // Wait for capture to complete
+                // For some reason using vcos_semaphore_wait_timeout sometimes returns immediately with bad parameter error
+                // even though it appears to be all correct, so reverting to untimed one until figure out why its erratic
+                vcos_semaphore_wait(&callback_data.complete_semaphore);
+                if (state.common_settings.verbose)
+                fprintf(stderr, "Finished capture %d\n", frame);
+            }
+
+            // Ensure we don't die if get callback with no open file
+            callback_data.file_handle = NULL;
+
+            if (output_file != stdout)
+            {
+                rename_file(&state, output_file, final_filename, use_filename, frame);
+            }
+            else
+            {
+                fflush(output_file);
+            }
+            // Disable encoder output port
+            status = mmal_port_disable(encoder_output_port);
+
+        }
+        vcos_semaphore_delete(&callback_data.complete_semaphore);
+        
+
+
         
         return Ok(Camera {
             camera: camera,
